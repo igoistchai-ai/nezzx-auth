@@ -28,6 +28,9 @@ Discord Developer Portal -> Interactions Endpoint URL:
 Health check:
   https://YOUR-RENDER-DOMAIN.onrender.com/health
 
+Interaction response fix: instant ephemeral acknowledgement for commands, then
+async edit with bounded work and detailed Render error logging.
+
 Five protections: Discord Ed25519, owner/whitelist/blacklist controls,
 HMAC-indexed licenses, device binding+reset limit, AES-256-GCM at rest.
 Security limit: client-executed Lua cannot be made impossible to extract.
@@ -273,7 +276,7 @@ def message(content: str = "", *, embed_obj: Optional[dict] = None, components: 
 
 
 async def discord_request(method: str, path: str, **kwargs) -> httpx.Response:
-    async with httpx.AsyncClient(timeout=20) as client:
+    async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0)) as client:
         r = await client.request(method, f"https://discord.com/api/v10{path}", headers={"Authorization": f"Bot {BOT_TOKEN}"}, **kwargs)
         if r.status_code >= 400:
             log.warning("Discord API %s %s => %s %s", method, path.split("?")[0], r.status_code, r.text[:180])
@@ -427,7 +430,9 @@ async def publish_panel(guild_id: str, channel_id: str, actor: str) -> dict:
     if result is None or not result.is_success:
         result = await discord_request("POST", f"/channels/{channel_id}/messages", json=panel_data)
     if not result.is_success:
-        return message("❌ Не удалось отправить панель. Проверь права **View Channel**, **Send Messages**, **Embed Links** и настройки канала.")
+        return message(f"❌ Панель не опубликована (Discord HTTP {result.status_code}). "
+                       "Проверь права бота: View Channel, Send Messages, Embed Links. "
+                       "Если это 401/403, проверь токен и разрешения роли бота.")
     message_id = str(result.json()["id"])
     with SessionLocal() as db:
         row = db.get(PublicPanel, guild_id)
@@ -671,10 +676,9 @@ async def process_command(payload: dict, api_url: str) -> dict:
     if name == "help":
         return message(embed_obj=embed("Help", HELP_TEXT))
     if name == "access":
-        await ensure_buyer_role(guild_id)
+        # Fast response: BUYER role is created when granting/activating a license.
         return panel(False)
     if name == "panel":
-        await ensure_buyer_role(guild_id)
         return panel(True)
 
     if name == "upload":
@@ -890,6 +894,7 @@ def option(name, description, kind=STRING, required=True, choices=None):
     return item
 
 COMMANDS = [
+    {"name": "ping", "description": "Check NEZZX AUTH response speed"},
     {"name": "panel", "description": "Owner management panel"},
     {"name": "publishpanel", "description": "OWNER: post or refresh the public buyer panel in this channel"},
     {"name": "requests", "description": "OWNER: pending access requests"},
@@ -1034,32 +1039,87 @@ def health():
     return {"status": "ok"}
 
 
-async def edit_deferred(payload: dict, result: dict) -> None:
+# Keep strong references to background tasks until they finish.
+background_tasks: set[asyncio.Task] = set()
+
+
+def enqueue_task(coro) -> None:
+    task = asyncio.create_task(coro)
+    background_tasks.add(task)
+    task.add_done_callback(background_tasks.discard)
+
+
+def instant_result(payload: dict) -> Optional[dict]:
+    """Answer interaction types that require no network or database round trips."""
+    data = payload.get("data") or {}
+    command = data.get("name", "")
+    user = user_id_from_interaction(payload)
+    owner = user in OWNER_IDS
+    if command == "ping":
+        result = message("✅ NEZZX AUTH работает. Discord-команда обработана без ожидания базы данных.")
+    elif command == "panel":
+        result = panel(True) if owner else message("⛔ Панель владельца доступна только владельцу приложения.")
+    elif command == "access":
+        result = panel(False)
+    elif command == "help":
+        result = message(embed_obj=embed("NEZZX AUTH • Help", HELP_TEXT))
+    else:
+        return None
+    return {"type": 4, "data": {**result, "flags": 64}}
+
+
+async def edit_original_response(payload: dict, result: dict) -> bool:
+    """Replace the instantly acknowledged private response via interaction webhook."""
     token = payload["token"]
     url = f"https://discord.com/api/v10/webhooks/{APP_ID}/{token}/messages/@original"
+    result = dict(result)
     attached = result.pop("_file", None)
-    async with httpx.AsyncClient(timeout=18) as client:
-        if attached:
-            filename, content = attached
-            result["attachments"] = [{"id": 0, "filename": filename}]
-            response = await client.patch(url, data={"payload_json": json.dumps(result)}, files={"files[0]": (filename, content, "text/plain")})
-        else:
-            response = await client.patch(url, json=result)
-    if response.status_code >= 400:
-        log.warning("Discord webhook edit failed: %s %s", response.status_code, response.text[:160])
+    # Discord rejects some combinations of attachment metadata on edits;
+    # serialize multipart only when actually sending a loader.
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0)) as client:
+            if attached:
+                filename, content = attached
+                result["attachments"] = [{"id": 0, "filename": filename}]
+                response = await client.patch(
+                    url, data={"payload_json": json.dumps(result, ensure_ascii=False)},
+                    files={"files[0]": (filename, content, "text/plain")})
+            else:
+                response = await client.patch(url, json=result)
+        if response.is_success:
+            log.info("Reply delivered for interaction id=%s", payload.get("id", "?"))
+            return True
+        log.error("Discord reply failed: HTTP %s, body=%s", response.status_code, response.text[:350])
+    except httpx.HTTPError as exc:
+        log.error("Discord reply network error: %s", type(exc).__name__)
+    return False
 
 
-async def handle_deferred(payload: dict, api_url: str) -> None:
+async def run_interaction(payload: dict, api_url: str) -> None:
+    kind = (payload.get("data") or {}).get("name") or (payload.get("data") or {}).get("custom_id") or "unknown"
+    started = time.monotonic()
     try:
-        result = await process_command(payload, api_url)
-    except Exception as exc:
-        # Never include exception details (keys, paths, DB data) in user-visible errors.
-        log.exception("Interaction handler failed: %s", type(exc).__name__)
-        result = message("⚠️ Операция не завершена. Проверь параметры и журнал сервиса.")
-    try:
-        await edit_deferred(payload, result)
-    except Exception as exc:
-        log.warning("Unable to answer interaction: %s", type(exc).__name__)
+        # SQLAlchemy in the application uses a synchronous DB driver.
+        # Keep blocking database/HTTP work out of FastAPI's event loop so
+        # all other Discord interactions are acknowledged immediately.
+        result = await asyncio.wait_for(
+            asyncio.to_thread(lambda: asyncio.run(process_command(payload, api_url))),
+            timeout=45,
+        )
+    except asyncio.TimeoutError:
+        log.error("Discord interaction timed out (45s): %s", kind)
+        result = message("❌ Операция превысила 45 секунд. Проверь Render → Logs и доступность PostgreSQL/Discord API.")
+    except Exception:
+        log.exception("Discord interaction failed: %s", kind)
+        result = message("❌ Ошибка обработки команды. Проверь Render → Logs (раздел Interaction failed).")
+
+    delivered = await edit_original_response(payload, result)
+    if not delivered:
+        # If the edit fails, the initial message remains visible (rather than
+        # a perpetual 'application is thinking' indicator). Logs contain HTTP code.
+        log.error("Unable to complete interaction %s after %.2f s", kind, time.monotonic() - started)
+    else:
+        log.info("Completed %s in %.2f s", kind, time.monotonic() - started)
 
 
 @app.post("/interactions")
@@ -1068,10 +1128,10 @@ async def interactions(request: Request):
     timestamp = request.headers.get("X-Signature-Timestamp", "")
     raw = await request.body()
     try:
-        # Reject stale replayed signed interaction messages.
         if abs(time.time() - int(timestamp)) > 300:
             raise ValueError("stale timestamp")
-        Ed25519PublicKey.from_public_bytes(bytes.fromhex(PUBLIC_KEY)).verify(bytes.fromhex(signature), timestamp.encode() + raw)
+        Ed25519PublicKey.from_public_bytes(bytes.fromhex(PUBLIC_KEY)).verify(
+            bytes.fromhex(signature), timestamp.encode() + raw)
     except (InvalidSignature, ValueError, TypeError):
         raise HTTPException(401, detail="Invalid Discord signature")
     try:
@@ -1080,20 +1140,31 @@ async def interactions(request: Request):
         raise HTTPException(400, detail="Invalid JSON")
     if payload.get("type") == 1:
         return JSONResponse({"type": 1})
-    if payload.get("type") == 3 and (payload.get("data") or {}).get("custom_id") == "buyer:redeem":
+    data = payload.get("data") or {}
+    if payload.get("type") == 3 and data.get("custom_id") == "buyer:redeem":
         return JSONResponse({"type": 9, "data": {"custom_id": "modal:redeem", "title": "Activate your license", "components": [{"type": 18, "label": "License key", "component": {"type": 4, "custom_id": "key", "style": 1, "placeholder": "NZX-...", "required": True, "max_length": 200}}]}})
     if payload.get("type") not in (2, 3, 5):
         return JSONResponse({"type": 4, "data": {"content": "Unsupported interaction", "flags": 64}})
+
+    kind = data.get("name") or data.get("custom_id") or "unknown"
+    log.info("Discord interaction received: %s", kind)
+    instant = instant_result(payload)
+    if instant is not None:
+        log.info("Instant reply: %s", kind)
+        return JSONResponse(instant)
+
     public_base = os.environ.get("PUBLIC_BASE_URL", "").strip().rstrip("/")
     if not public_base:
         hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
-        if hostname:
-            public_base = "https://" + hostname
-        else:
-            # In local development only; Render provides RENDER_EXTERNAL_HOSTNAME.
-            public_base = str(request.base_url).rstrip("/")
-    asyncio.create_task(handle_deferred(payload, public_base))
-    return JSONResponse({"type": 5, "data": {"flags": 64}})
+        public_base = "https://" + hostname if hostname else str(request.base_url).rstrip("/")
+    enqueue_task(run_interaction(payload, public_base))
+    # A real, user-visible message immediately (NOT a deferred 'thinking...').
+    # If downstream services are slow, the user can see that the request landed.
+    return JSONResponse({"type": 4, "data": {
+        "content": "⏳ Запрос принят. Выполняю команду…",
+        "flags": 64,
+        "allowed_mentions": {"parse": []},
+    }})
 
 
 class LoadRequest(BaseModel):
