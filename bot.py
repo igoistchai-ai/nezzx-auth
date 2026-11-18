@@ -59,7 +59,7 @@ import httpx
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from dotenv import load_dotenv
 from fastapi import FastAPI, HTTPException, Request
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, Response
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PublicKey
 from cryptography.hazmat.primitives.kdf.hkdf import HKDF
@@ -71,6 +71,9 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sess
 load_dotenv()
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
 log = logging.getLogger("nezzx-auth")
+# HTTP library otherwise logs the full Discord interaction webhook URL (secret token).
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logging.getLogger("httpcore").setLevel(logging.WARNING)
 
 # App ID and public key are obtained from the official Discord API at startup.
 APP_ID = ""
@@ -314,7 +317,7 @@ def panel(owner: bool) -> dict:
         return message(embed_obj=embed("OWNER • Control Panel", text), components=(
             *buttons_row(button("📨 Заявки", "owner:requests", 1), button("Scripts", "owner:scripts", 1),
                          button("Licenses", "owner:licenses", 1), button("Statistics", "owner:stats", 1)),
-            *buttons_row(button("📢 Опубликовать панель", "owner:publish", 3), button("Команды", "owner:help", 2))))
+            *buttons_row(button("📢 Как опубликовать панель", "owner:publish", 3), button("Команды", "owner:help", 2))))
     return buyer_public_panel()
 
 
@@ -1063,60 +1066,110 @@ def instant_result(payload: dict) -> Optional[dict]:
         result = panel(False)
     elif command == "help":
         result = message(embed_obj=embed("NEZZX AUTH • Help", HELP_TEXT))
+    elif command == "publishpanel":
+        if not owner:
+            return {"type": 4, "data": {**message("⛔ Команда доступна только владельцу."), "flags": 64}}
+        if not payload.get("guild_id") or not payload.get("channel_id"):
+            return {"type": 4, "data": {**message("Используй `/publishpanel` внутри текстового канала на сервере."), "flags": 64}}
+        # Publish the actual PUBLIC panel *as the HTTP interaction response*.
+        # No BOT-token POST /channels/{id}/messages, no webhook PATCH, no 403/429.
+        # Anyone with permission to view this channel can use its buttons.
+        result = buyer_public_panel()
+        return {"type": 4, "data": result}
+    elif data.get("custom_id") == "owner:publish":
+        result = message("📢 Чтобы опубликовать общую панель, напиши `/publishpanel` "
+                         "в нужном канале. Ответ команды сразу станет публичной панелью. "
+                         "Закрепи опубликованное сообщение через меню Discord.")
     else:
         return None
     return {"type": 4, "data": {**result, "flags": 64}}
 
 
 async def edit_original_response(payload: dict, result: dict) -> bool:
-    """Replace the instantly acknowledged private response via interaction webhook."""
+    """Fallback for slow operations only; the fast path uses direct callbacks."""
     token = payload["token"]
     url = f"https://discord.com/api/v10/webhooks/{APP_ID}/{token}/messages/@original"
     result = dict(result)
     attached = result.pop("_file", None)
-    # Discord rejects some combinations of attachment metadata on edits;
-    # serialize multipart only when actually sending a loader.
+    # Retry only if Discord provides a safe Retry-After value.
     try:
         async with httpx.AsyncClient(timeout=httpx.Timeout(12.0, connect=4.0)) as client:
-            if attached:
-                filename, content = attached
-                result["attachments"] = [{"id": 0, "filename": filename}]
-                response = await client.patch(
-                    url, data={"payload_json": json.dumps(result, ensure_ascii=False)},
-                    files={"files[0]": (filename, content, "text/plain")})
-            else:
-                response = await client.patch(url, json=result)
-        if response.is_success:
-            log.info("Reply delivered for interaction id=%s", payload.get("id", "?"))
-            return True
-        log.error("Discord reply failed: HTTP %s, body=%s", response.status_code, response.text[:350])
+            for attempt in range(2):
+                if attached:
+                    filename, content = attached
+                    result["attachments"] = [{"id": 0, "filename": filename}]
+                    response = await client.patch(url, data={"payload_json": json.dumps(result, ensure_ascii=False)},
+                                                  files={"files[0]": (filename, content, "text/plain")})
+                else:
+                    response = await client.patch(url, json=result)
+                if response.is_success:
+                    log.info("Reply delivered for interaction id=%s", payload.get("id", "?"))
+                    return True
+                if response.status_code == 429:
+                    delay = None
+                    try:
+                        raw_delay = response.json().get("retry_after")
+                        if isinstance(raw_delay, (int, float)):
+                            delay = float(raw_delay)
+                    except (ValueError, TypeError, AttributeError):
+                        pass
+                    if delay is None:
+                        try:
+                            delay = float(response.headers.get("Retry-After", ""))
+                        except (TypeError, ValueError):
+                            pass
+                    if attempt == 0 and delay is not None and 0 < delay <= 7:
+                        log.warning("Discord 429: honoring Retry-After %.2fs, one retry only", delay)
+                        await asyncio.sleep(delay)
+                        continue
+                    log.error("Discord API returned 429, retry later. %s",
+                              "Rate-limit response had no usable Retry-After" if delay is None else f"Retry-After={delay}")
+                    return False
+                # Never leak interaction token or the full webhook URL into logs.
+                log.error("Discord reply failed: HTTP %s, code=%s", response.status_code,
+                          response.json().get("code") if response.headers.get("content-type", "").startswith("application/json") else "non-json")
+                return False
     except httpx.HTTPError as exc:
         log.error("Discord reply network error: %s", type(exc).__name__)
     return False
 
 
-async def run_interaction(payload: dict, api_url: str) -> None:
+def direct_response(result: dict, *, private: bool = True) -> Response:
+    """Reply from /interactions itself, avoiding rate-limited outbound requests."""
+    data = dict(result)
+    attached = data.pop("_file", None)
+    if private:
+        data["flags"] = 64
+    body = {"type": 4, "data": data}
+    if not attached:
+        return JSONResponse(body)
+    filename, content = attached
+    # A multipart Interaction Callback with a file, supported by Discord's API.
+    data["attachments"] = [{"id": 0, "filename": filename}]
+    json_blob = json.dumps(body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")
+    boundary = "nezzx_" + secrets.token_hex(16)
+    sep = ("--" + boundary + "\r\n").encode("ascii")
+    close = ("--" + boundary + "--\r\n").encode("ascii")
+    encoded_filename = filename.replace('"', '').replace("\r", "").replace("\n", "")
+    upload = (sep + b'Content-Disposition: form-data; name="payload_json"\r\n'
+              + b'Content-Type: application/json\r\n\r\n' + json_blob + b'\r\n'
+              + sep + f'Content-Disposition: form-data; name="files[0]"; filename="{encoded_filename}"\r\n'.encode("utf-8")
+              + b'Content-Type: text/plain\r\n\r\n' + content + b'\r\n' + close)
+    return Response(content=upload, media_type=f"multipart/form-data; boundary={boundary}")
+
+
+async def run_interaction(job: asyncio.Task, payload: dict, started: float) -> None:
+    """Complete an already-started slow job once (do not run commands twice)."""
     kind = (payload.get("data") or {}).get("name") or (payload.get("data") or {}).get("custom_id") or "unknown"
-    started = time.monotonic()
     try:
-        # SQLAlchemy in the application uses a synchronous DB driver.
-        # Keep blocking database/HTTP work out of FastAPI's event loop so
-        # all other Discord interactions are acknowledged immediately.
-        result = await asyncio.wait_for(
-            asyncio.to_thread(lambda: asyncio.run(process_command(payload, api_url))),
-            timeout=45,
-        )
+        result = await asyncio.wait_for(job, timeout=44)
     except asyncio.TimeoutError:
-        log.error("Discord interaction timed out (45s): %s", kind)
-        result = message("❌ Операция превысила 45 секунд. Проверь Render → Logs и доступность PostgreSQL/Discord API.")
+        log.error("Discord interaction timed out: %s", kind)
+        result = message("❌ Слишком долго. Проверь доступность базы данных и Render Logs.")
     except Exception:
         log.exception("Discord interaction failed: %s", kind)
-        result = message("❌ Ошибка обработки команды. Проверь Render → Logs (раздел Interaction failed).")
-
-    delivered = await edit_original_response(payload, result)
-    if not delivered:
-        # If the edit fails, the initial message remains visible (rather than
-        # a perpetual 'application is thinking' indicator). Logs contain HTTP code.
+        result = message("❌ Ошибка команды. Подробности находятся в Render → Logs.")
+    if not await edit_original_response(payload, result):
         log.error("Unable to complete interaction %s after %.2f s", kind, time.monotonic() - started)
     else:
         log.info("Completed %s in %.2f s", kind, time.monotonic() - started)
@@ -1157,14 +1210,26 @@ async def interactions(request: Request):
     if not public_base:
         hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
         public_base = "https://" + hostname if hostname else str(request.base_url).rstrip("/")
-    enqueue_task(run_interaction(payload, public_base))
-    # A real, user-visible message immediately (NOT a deferred 'thinking...').
-    # If downstream services are slow, the user can see that the request landed.
-    return JSONResponse({"type": 4, "data": {
-        "content": "⏳ Запрос принят. Выполняю команду…",
-        "flags": 64,
-        "allowed_mentions": {"parse": []},
-    }})
+    started = time.monotonic()
+    # For normal, quick database operations, answer in the ORIGINAL interaction
+    # callback. This avoids a subsequent PATCH that can fail with Discord 429.
+    # For slow operations, keep the SAME running job and finish via webhook.
+    job = asyncio.create_task(asyncio.to_thread(lambda: asyncio.run(process_command(payload, public_base))))
+    try:
+        result = await asyncio.wait_for(asyncio.shield(job), timeout=1.7)
+    except asyncio.TimeoutError:
+        enqueue_task(run_interaction(job, payload, started))
+        return JSONResponse({"type": 4, "data": {
+            "content": "⏳ Выполняю команду… Если ответ не обновится, посмотри Render → Logs.",
+            "flags": 64, "allowed_mentions": {"parse": []},
+        }})
+    except Exception:
+        log.exception("Discord command failed immediately: %s", kind)
+        return direct_response(message("❌ Ошибка команды. Подробности: Render → Logs."))
+    else:
+        log.info("Direct reply completed: %s in %.2f s", kind, time.monotonic() - started)
+        return direct_response(result)
+
 
 
 class LoadRequest(BaseModel):
