@@ -925,64 +925,191 @@ COMMANDS = [
 
 # ---------------- Client loader template (embedded) ----------------
 LUA_LOADER_TEMPLATE = r'''
--- NEZZX AUTH | Lua loader
--- The Discord /loader command generates this file with actual URL, script and key.
+-- NEZZX AUTH | Diagnostic Lua loader (Roblox Luau)
+-- Команда /loader подставляет реальный адрес Render, скрипт и ключ.
 local API_URL = __API_URL__
 local SCRIPT_NAME = __SCRIPT_NAME__
 local LICENSE_KEY = __LICENSE_KEY__
 
 local HttpService = game:GetService("HttpService")
-local requestFn = request or http_request or (syn and syn.request) or (http and http.request)
-assert(type(requestFn) == "function", "Your Lua environment does not expose HTTP requests")
+local Players = game:GetService("Players")
+local statusGui, statusLabel
 
--- A persistent installation identifier, not a cryptographic hardware fingerprint.
-local function deviceId()
+local function showStatus(text, failed)
+    local line = "[NEZZX AUTH] " .. tostring(text)
+    if failed then
+        warn(line)
+    else
+        print(line)
+    end
+    if not statusGui then
+        pcall(function()
+            local player = Players.LocalPlayer
+            local playerGui = player and player:FindFirstChildOfClass("PlayerGui")
+            if not playerGui then
+                playerGui = player and player:WaitForChild("PlayerGui", 4)
+            end
+            if not playerGui then return end
+            local old = playerGui:FindFirstChild("NEZZX_AUTH_STATUS")
+            if old then old:Destroy() end
+
+            local gui = Instance.new("ScreenGui")
+            gui.Name = "NEZZX_AUTH_STATUS"
+            gui.ResetOnSpawn = false
+            gui.IgnoreGuiInset = true
+            gui.DisplayOrder = 1000
+
+            local frame = Instance.new("Frame")
+            frame.Name = "Panel"
+            frame.AnchorPoint = Vector2.new(0.5, 0)
+            frame.Position = UDim2.new(0.5, 0, 0, 20)
+            frame.Size = UDim2.new(0, 365, 0, 84)
+            frame.BackgroundColor3 = Color3.fromRGB(21, 22, 29)
+            frame.BorderSizePixel = 0
+            frame.Parent = gui
+
+            local corner = Instance.new("UICorner")
+            corner.CornerRadius = UDim.new(0, 14)
+            corner.Parent = frame
+
+            local stroke = Instance.new("UIStroke")
+            stroke.Thickness = 1
+            stroke.Color = Color3.fromRGB(222, 185, 65)
+            stroke.Transparency = 0.4
+            stroke.Parent = frame
+
+            local title = Instance.new("TextLabel")
+            title.BackgroundTransparency = 1
+            title.Position = UDim2.fromOffset(16, 9)
+            title.Size = UDim2.new(1, -32, 0, 24)
+            title.Font = Enum.Font.GothamBold
+            title.TextSize = 16
+            title.TextXAlignment = Enum.TextXAlignment.Left
+            title.TextColor3 = Color3.fromRGB(247, 211, 102)
+            title.Text = "NEZZX AUTH"
+            title.Parent = frame
+
+            local label = Instance.new("TextLabel")
+            label.BackgroundTransparency = 1
+            label.Position = UDim2.fromOffset(16, 35)
+            label.Size = UDim2.new(1, -32, 0, 40)
+            label.Font = Enum.Font.Gotham
+            label.TextSize = 12
+            label.TextWrapped = true
+            label.TextXAlignment = Enum.TextXAlignment.Left
+            label.TextYAlignment = Enum.TextYAlignment.Top
+            label.TextColor3 = Color3.fromRGB(217, 222, 230)
+            label.Text = ""
+            label.Parent = frame
+
+            gui.Parent = playerGui
+            statusGui, statusLabel = gui, label
+        end)
+    end
+    if statusLabel then
+        statusLabel.Text = tostring(text):sub(1, 220)
+        statusLabel.TextColor3 = failed and Color3.fromRGB(255, 146, 146) or Color3.fromRGB(217, 222, 230)
+    end
+end
+
+local function stableDeviceId()
     if type(gethwid) == "function" then
         local ok, value = pcall(gethwid)
         if ok and type(value) == "string" and #value >= 8 then
             return "hwid:" .. value
         end
     end
+
     if type(isfile) ~= "function" or type(readfile) ~= "function" or type(writefile) ~= "function" then
-        error("Persistent file API (isfile/readfile/writefile) or gethwid is required")
+        error("No stable device ID: gethwid or file APIs (isfile/readfile/writefile) required")
     end
     local filename = "nezzx_auth_device_id.txt"
     local ok, exists = pcall(isfile, filename)
-    if ok and exists then
+    if not ok then error("Cannot check saved device ID") end
+    if exists then
         local readOK, value = pcall(readfile, filename)
         if readOK and type(value) == "string" and #value >= 16 then
             return "install:" .. value
         end
+        error("Saved device ID is unreadable; check executor file access")
     end
+
     local value = HttpService:GenerateGUID(false)
-    local saved = pcall(writefile, filename, value)
-    assert(saved, "Cannot save device ID. Check the Lua environment's file permissions")
+    local saved, saveError = pcall(writefile, filename, value)
+    if not saved then
+        error("Cannot save device ID: " .. tostring(saveError))
+    end
     return "install:" .. value
 end
 
-local body = HttpService:JSONEncode({
-    key = LICENSE_KEY,
-    device_id = deviceId(),
-    script = SCRIPT_NAME
-})
-local ok, response = pcall(requestFn, {
-    Url = API_URL .. "/api/v1/load",
-    Method = "POST",
-    Headers = { ["Content-Type"] = "application/json" },
-    Body = body
-})
-assert(ok and type(response) == "table", "Authorization service is temporarily unavailable")
+local function doLoad()
+    showStatus("1/4  Проверяю окружение Lua...", false)
+    local requestFn = request or http_request or (syn and syn.request) or (http and http.request)
+    if type(requestFn) ~= "function" then
+        error("HTTP API missing: request / http_request / syn.request")
+    end
+    if type(loadstring) ~= "function" then
+        error("loadstring unavailable in this Lua environment")
+    end
+    if type(API_URL) ~= "string" or not API_URL:match("^https://") then
+        error("Invalid API URL in loader; get a new /loader file")
+    end
 
-local status = tonumber(response.StatusCode or response.Status or 0)
-local dataOK, data = pcall(HttpService.JSONDecode, HttpService, response.Body or "")
-assert(dataOK and type(data) == "table", "Invalid authorization response")
-if status ~= 200 or not data.ok then
-    error("NEZZX AUTH: " .. tostring(data.error or "Authorization denied"))
+    showStatus("2/4  Проверяю лицензию на сервере...", false)
+    local body = HttpService:JSONEncode({
+        key = LICENSE_KEY,
+        device_id = stableDeviceId(),
+        script = SCRIPT_NAME
+    })
+    local ok, response = pcall(requestFn, {
+        Url = API_URL .. "/api/v1/load",
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = body
+    })
+    if not ok then
+        error("Network request failed: " .. tostring(response))
+    end
+    if type(response) ~= "table" then
+        error("Unexpected HTTP response type: " .. type(response))
+    end
+
+    local httpStatus = tonumber(response.StatusCode or response.status_code or response.Status or response.status or 0) or 0
+    local rawBody = response.Body or response.body or ""
+    local decodedOK, data = pcall(HttpService.JSONDecode, HttpService, rawBody)
+    if not decodedOK or type(data) ~= "table" then
+        error("Server returned non-JSON (HTTP " .. httpStatus .. "). Check Render /health and Logs")
+    end
+    if httpStatus ~= 200 or data.ok ~= true then
+        error("License check failed (HTTP " .. httpStatus .. "): " .. tostring(data.error or "Access denied"))
+    end
+
+    showStatus("3/4  Компилирую полученный Lua...", false)
+    if type(data.code) ~= "string" then
+        error("Server response has no code (invalid script data)")
+    end
+    local fn, compileError = loadstring(data.code)
+    if type(fn) ~= "function" then
+        error("Lua compile error: " .. tostring(compileError))
+    end
+
+    showStatus("4/4  Запускаю скрипт...", false)
+    local scriptOK, scriptError = pcall(fn)
+    if not scriptOK then
+        error("Uploaded Lua script crashed: " .. tostring(scriptError))
+    end
+    showStatus("Успешно: скрипт запущен.", false)
+    if statusGui then
+        task.delay(5, function()
+            if statusGui and statusGui.Parent then statusGui:Destroy() end
+        end)
+    end
 end
 
-local fn, compileError = loadstring(data.code)
-assert(fn, "Lua compile error: " .. tostring(compileError))
-return fn()
+local success, err = pcall(doLoad)
+if not success then
+    showStatus("ОШИБКА: " .. tostring(err), true)
+end
 '''
 
 def startup_discord_setup() -> None:
