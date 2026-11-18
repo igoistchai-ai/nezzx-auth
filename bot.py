@@ -50,7 +50,7 @@ import secrets
 import threading
 import time
 from collections import defaultdict, deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from typing import Optional
 from urllib.parse import urlparse
@@ -963,7 +963,11 @@ local function showStatus(text, failed)
             frame.Name = "Panel"
             frame.AnchorPoint = Vector2.new(0.5, 0)
             frame.Position = UDim2.new(0.5, 0, 0, 20)
-            frame.Size = UDim2.new(0, 365, 0, 84)
+            frame.Size = UDim2.new(0.90, 0, 0, 142)
+            local sizeLimit = Instance.new("UISizeConstraint")
+            sizeLimit.MaxSize = Vector2.new(630, 180)
+            sizeLimit.MinSize = Vector2.new(250, 120)
+            sizeLimit.Parent = frame
             frame.BackgroundColor3 = Color3.fromRGB(21, 22, 29)
             frame.BorderSizePixel = 0
             frame.Parent = gui
@@ -992,7 +996,7 @@ local function showStatus(text, failed)
             local label = Instance.new("TextLabel")
             label.BackgroundTransparency = 1
             label.Position = UDim2.fromOffset(16, 35)
-            label.Size = UDim2.new(1, -32, 0, 40)
+            label.Size = UDim2.new(1, -32, 0, 96)
             label.Font = Enum.Font.Gotham
             label.TextSize = 12
             label.TextWrapped = true
@@ -1007,7 +1011,7 @@ local function showStatus(text, failed)
         end)
     end
     if statusLabel then
-        statusLabel.Text = tostring(text):sub(1, 220)
+        statusLabel.Text = tostring(text):sub(1, 550)
         statusLabel.TextColor3 = failed and Color3.fromRGB(255, 146, 146) or Color3.fromRGB(217, 222, 230)
     end
 end
@@ -1042,63 +1046,192 @@ local function stableDeviceId()
     return "install:" .. value
 end
 
-local function doLoad()
-    showStatus("1/4  Проверяю окружение Lua...", false)
-    local requestFn = request or http_request or (syn and syn.request) or (http and http.request)
-    if type(requestFn) ~= "function" then
-        error("HTTP API missing: request / http_request / syn.request")
+-- Выбираем работающий сетевой API, не привязываясь к одному исполнителю.
+local function getRequestFunctions()
+    local choices = {}
+    local seen = {}
+    local function add(label, fn)
+        if type(fn) == "function" and not seen[fn] then
+            seen[fn] = true
+            table.insert(choices, { name = label, fn = fn })
+        end
     end
-    if type(loadstring) ~= "function" then
-        error("loadstring unavailable in this Lua environment")
+    add("request", request)
+    add("http_request", http_request)
+    if type(syn) == "table" then add("syn.request", syn.request) end
+    if type(http) == "table" then add("http.request", http.request) end
+    if type(fluxus) == "table" then add("fluxus.request", fluxus.request) end
+    return choices
+end
+
+local function shorten(text, maxLen)
+    text = tostring(text or "")
+    text = text:gsub("[%c]+", " ")
+    return text:sub(1, maxLen or 180)
+end
+
+local function normalizeResponse(response)
+    -- Разные HTTP API возвращают StatusCode/Body или status/body.
+    if type(response) == "string" then
+        return 0, response, "string response"
     end
-    if type(API_URL) ~= "string" or not API_URL:match("^https://") then
-        error("Invalid API URL in loader; get a new /loader file")
+    if type(response) ~= "table" then
+        return 0, "", "returned " .. type(response)
+    end
+    local wrapped = response.Response
+    if type(wrapped) == "table" then response = wrapped end
+    local code = tonumber(response.StatusCode or response.status_code or response.Status or response.status or response.code or 0) or 0
+    local content = response.Body or response.body or response.ResponseBody or response.responseText or response.Data or ""
+    if type(content) ~= "string" then content = "" end
+    local hint = response.StatusMessage or response.statusMessage or response.ErrorMessage or response.Error or response.error or response.Message or ""
+    return code, content, shorten(hint, 90)
+end
+
+local function performRequest(options)
+    local errors = {}
+    for _, choice in ipairs(getRequestFunctions()) do
+        local ok, response = pcall(choice.fn, options)
+        if ok then
+            local code, body, hint = normalizeResponse(response)
+            if code > 0 or #body > 0 then
+                return { code = code, body = body, hint = hint, api = choice.name }, nil
+            end
+            table.insert(errors, choice.name .. ": empty (HTTP 0) " .. hint)
+        else
+            table.insert(errors, choice.name .. ": " .. shorten(response, 100))
+        end
+    end
+    if #errors == 0 then
+        return nil, "HTTP request API is not available"
+    end
+    return nil, table.concat(errors, "; ")
+end
+
+local function get(url)
+    return performRequest({ Url = url, Method = "GET", Headers = { ["Accept"] = "application/json" } })
+end
+
+local function diagnoseNetwork(postError)
+    -- Проверяем GET и POST отдельно, без передачи ключа на тестовый эндпоинт.
+    local health, healthError = get(API_URL .. "/health")
+    local post, pingError = performRequest({
+        Url = API_URL .. "/api/v1/ping",
+        Method = "POST",
+        Headers = { ["Content-Type"] = "application/json" },
+        Body = "{}",
+    })
+    local summary = "Render GET /health: "
+        .. (health and ("HTTP " .. tostring(health.code)) or shorten(healthError, 80))
+        .. "\nRender POST /api/v1/ping: "
+        .. (post and ("HTTP " .. tostring(post.code)) or shorten(pingError, 80))
+
+    if health and health.code == 200 and post and post.code == 200 then
+        error("POST /api/v1/load не прошёл: " .. shorten(postError or "HTTP 0, нет ответа", 100)
+            .. "\nRender доступен по GET и POST. Проверь Render Logs и размеры скрипта.\n"
+            .. summary, 0)
     end
 
-    showStatus("2/4  Проверяю лицензию на сервере...", false)
+    if health and health.code == 200 and (not post or post.code == 0) then
+        error("Real не получил ответ на POST. Проверь HTTP API исполнителя.\n"
+            .. summary, 0)
+    end
+
+    local external, externalError = get("https://example.com/")
+    local internet = external and ("HTTP " .. tostring(external.code)) or shorten(externalError, 70)
+    error("Сетевая ошибка: " .. shorten(postError or "HTTP 0", 90)
+        .. "\n" .. summary .. "\nExternal HTTPS: " .. internet, 0)
+end
+
+-- У Render иногда бывает холодный запуск. Повторяем только сетевые ошибки и 5xx.
+local function loadWithRetries(requestOptions)
+    local lastResult, lastError
+    for attempt = 1, 3 do
+        showStatus("2/4  Авторизация на Render, попытка " .. tostring(attempt) .. "/3", false)
+        local response, err = performRequest(requestOptions)
+        lastResult, lastError = response, err
+        if response then
+            local code = response.code
+            if code ~= 408 and code ~= 429 and code ~= 500 and code ~= 502
+                and code ~= 503 and code ~= 504 then
+                return response, nil
+            end
+        end
+        if attempt < 3 then
+            if attempt == 1 then
+                get(API_URL .. "/health") -- пробуждаем Render перед повтором
+            end
+            task.wait(attempt * 2)
+        end
+    end
+    return lastResult, lastError
+end
+
+local function doLoad()
+    showStatus("1/4  Проверяю Lua и адрес сервера...", false)
+    if #getRequestFunctions() == 0 then
+        error("Никакой HTTP API не найден (request/http_request/syn.request)", 0)
+    end
+    if type(loadstring) ~= "function" then
+        error("loadstring не поддерживается в этой Lua-среде", 0)
+    end
+    if type(API_URL) ~= "string" or not API_URL:match("^https://[%w%.-]+") then
+        error("Некорректный Render API URL; возьми новый /loader", 0)
+    end
+
+    showStatus("2/4  Подключаюсь к Render и проверяю лицензию...", false)
     local body = HttpService:JSONEncode({
         key = LICENSE_KEY,
         device_id = stableDeviceId(),
-        script = SCRIPT_NAME
+        script = SCRIPT_NAME,
     })
-    local ok, response = pcall(requestFn, {
+    local result, resultError = loadWithRetries({
         Url = API_URL .. "/api/v1/load",
         Method = "POST",
-        Headers = { ["Content-Type"] = "application/json" },
-        Body = body
+        Headers = {
+            ["Content-Type"] = "application/json",
+            ["Accept"] = "application/json",
+        },
+        Body = body,
     })
-    if not ok then
-        error("Network request failed: " .. tostring(response))
+
+    if not result then
+        diagnoseNetwork(resultError or "request failed")
     end
-    if type(response) ~= "table" then
-        error("Unexpected HTTP response type: " .. type(response))
+    local status, rawBody = result.code, result.body
+    if #rawBody == 0 then
+        if status > 0 then
+            error("Render вернул HTTP " .. tostring(status) .. " с пустым ответом. Проверь Render Logs.", 0)
+        end
+        diagnoseNetwork("HTTP 0 with empty body; " .. result.hint)
     end
 
-    local httpStatus = tonumber(response.StatusCode or response.status_code or response.Status or response.status or 0) or 0
-    local rawBody = response.Body or response.body or ""
     local decodedOK, data = pcall(HttpService.JSONDecode, HttpService, rawBody)
     if not decodedOK or type(data) ~= "table" then
-        error("Server returned non-JSON (HTTP " .. httpStatus .. "). Check Render /health and Logs")
+        -- Cloudflare/Render may return an HTML error page (502/503/429), not JSON.
+        error("HTTP " .. tostring(status) .. ": сервер вернул не JSON. Ответ: " .. shorten(rawBody, 210) .. "\nURL: " .. shorten(API_URL, 110), 0)
     end
-    if httpStatus ~= 200 or data.ok ~= true then
-        error("License check failed (HTTP " .. httpStatus .. "): " .. tostring(data.error or "Access denied"))
+    if data.ok ~= true then
+        error("Авторизация отклонена (HTTP " .. tostring(status) .. "): " .. shorten(data.error or "unknown server error", 230), 0)
+    end
+    if status ~= 200 and status ~= 0 then
+        error("Неожиданный ответ сервера HTTP " .. tostring(status), 0)
     end
 
-    showStatus("3/4  Компилирую полученный Lua...", false)
+    showStatus("3/4  Проверяю и компилирую Lua...", false)
     if type(data.code) ~= "string" then
-        error("Server response has no code (invalid script data)")
+        error("Сервер не прислал код Lua", 0)
     end
     local fn, compileError = loadstring(data.code)
     if type(fn) ~= "function" then
-        error("Lua compile error: " .. tostring(compileError))
+        error("Ошибка компиляции полученного Lua: " .. tostring(compileError), 0)
     end
 
     showStatus("4/4  Запускаю скрипт...", false)
     local scriptOK, scriptError = pcall(fn)
     if not scriptOK then
-        error("Uploaded Lua script crashed: " .. tostring(scriptError))
+        error("Ошибка в загруженном Lua: " .. tostring(scriptError), 0)
     end
-    showStatus("Успешно: скрипт запущен.", false)
+    showStatus("Скрипт успешно запущен.", false)
     if statusGui then
         task.delay(5, function()
             if statusGui and statusGui.Parent then statusGui:Destroy() end
@@ -1126,16 +1259,38 @@ def startup_discord_setup() -> None:
             log.info("Registered %s global Discord commands.", len(COMMANDS))
 
 
+async def initialize_discord_in_background() -> None:
+    """Never block Render HTTP startup on Discord network availability."""
+    delay = 3
+    while True:
+        try:
+            await asyncio.to_thread(load_discord_identity)
+            # The identity is ready: public key verification can now work.
+            try:
+                await asyncio.to_thread(startup_discord_setup)
+            except Exception as exc:
+                log.warning("Discord command registration failed (use /register when online): %s", type(exc).__name__)
+            log.info("Discord initialization completed.")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Discord is unavailable. Will retry in %s seconds.", delay)
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 60)
+
+
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
     boot_database()
-    # Public verification key and app ID are loaded before requests are served.
-    await asyncio.to_thread(load_discord_identity)
+    # /health and /api/v1/load are available even during Discord API outages.
+    discord_task = asyncio.create_task(initialize_discord_in_background())
     try:
-        await asyncio.to_thread(startup_discord_setup)
-    except Exception as exc:
-        log.warning("Discord command registration failed; check bot permissions: %s", type(exc).__name__)
-    yield
+        yield
+    finally:
+        discord_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await discord_task
 
 
 app = FastAPI(title="NEZZX AUTH", lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None)
@@ -1167,6 +1322,13 @@ def index():
 @app.get("/health")
 def health():
     return {"status": "ok"}
+
+
+@app.post("/api/v1/ping")
+def api_ping():
+    """Small unauthenticated POST probe to distinguish TLS/POST failures from key issues."""
+    return JSONResponse({"ok": True, "service": "NEZZX AUTH", "method": "POST"},
+                        headers={"Cache-Control": "no-store", "X-Content-Type-Options": "nosniff"})
 
 
 # Keep strong references to background tasks until they finish.
@@ -1337,6 +1499,8 @@ async def interactions(request: Request):
     if not public_base:
         hostname = os.environ.get("RENDER_EXTERNAL_HOSTNAME", "").strip()
         public_base = "https://" + hostname if hostname else str(request.base_url).rstrip("/")
+    if not public_base.startswith("https://"):
+        log.warning("Loader base URL is not HTTPS. Set PUBLIC_BASE_URL=https://YOUR-SERVICE.onrender.com")
     started = time.monotonic()
     # For normal, quick database operations, answer in the ORIGINAL interaction
     # callback. This avoids a subsequent PATCH that can fail with Discord 429.
